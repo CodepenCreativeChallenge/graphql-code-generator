@@ -2,8 +2,7 @@ import { lifecycleHooks } from './hooks.js';
 import { Types } from '@graphql-codegen/plugin-helpers';
 import { executeCodegen } from './codegen.js';
 import { createWatcher } from './utils/watcher.js';
-import { fileExists, readFile, writeFile, unlinkFile } from './utils/file-system.js';
-import mkdirp from 'mkdirp';
+import { readFile, writeFile, unlinkFile, mkdirp } from './utils/file-system.js';
 import { dirname, join, isAbsolute } from 'path';
 import { debugLog } from './utils/debugging.js';
 import { CodegenContext, ensureContext } from './config.js';
@@ -58,7 +57,13 @@ export async function generate(
       () =>
         Promise.all(
           generationResult.map(async (result: Types.FileOutput) => {
-            const exists = await fileExists(result.filename);
+            const previousHash = recentOutputHash.get(result.filename) || (await hashFile(result.filename));
+            const exists = previousHash !== null;
+
+            // Store previous hash to avoid reading from disk again
+            if (previousHash) {
+              recentOutputHash.set(result.filename, previousHash);
+            }
 
             if (!shouldOverwrite(config, result.filename) && exists) {
               return;
@@ -66,18 +71,16 @@ export async function generate(
 
             let content = result.content || '';
             const currentHash = hash(content);
-            let previousHash = recentOutputHash.get(result.filename);
-
-            if (!previousHash && exists) {
-              previousHash = hash(await readFile(result.filename));
-            }
 
             if (previousHash && currentHash === previousHash) {
               debugLog(`Skipping file (${result.filename}) writing due to indentical hash...`);
               return;
-            } else if (context.checkMode) {
+            }
+
+            // skip updating file in dry mode
+            if (context.checkMode) {
               context.checkModeStaleFiles.push(result.filename);
-              return; // skip updating file in dry mode
+              return;
             }
 
             if (content.length === 0) {
@@ -103,11 +106,12 @@ export async function generate(
               }
             }
 
-            recentOutputHash.set(result.filename, currentHash);
             await lifecycleHooks(result.hooks).beforeOneFileWrite(result.filename);
             await lifecycleHooks(config.hooks).beforeOneFileWrite(result.filename);
-            await mkdirp(basedir);
-            await writeFile(absolutePath, result.content);
+
+            await writeFile(absolutePath, content);
+            recentOutputHash.set(result.filename, currentHash);
+
             await lifecycleHooks(result.hooks).afterOneFileWrite(result.filename);
             await lifecycleHooks(config.hooks).afterOneFileWrite(result.filename);
           })
@@ -158,4 +162,17 @@ function shouldOverwrite(config: Types.Config, outputPath: string): boolean {
 
 function isConfiguredOutput(output: any): output is Types.ConfiguredOutput {
   return typeof output.plugins !== 'undefined';
+}
+
+async function hashFile(filePath: string): Promise<string | null> {
+  try {
+    return hash(await readFile(filePath));
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      // return null if file does not exist
+      return null;
+    }
+    // rethrow unexpected errors
+    throw err;
+  }
 }
