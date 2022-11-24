@@ -8,6 +8,7 @@ import { dirname, join, isAbsolute } from 'path';
 import { debugLog } from './utils/debugging.js';
 import { CodegenContext, ensureContext } from './config.js';
 import { createHash } from 'crypto';
+import { prettify } from './prettify.js';
 
 const hash = (content: string): string => createHash('sha1').update(content).digest('base64');
 
@@ -63,7 +64,7 @@ export async function generate(
               return;
             }
 
-            const content = result.content || '';
+            let content = result.content || '';
             const currentHash = hash(content);
             let previousHash = recentOutputHash.get(result.filename);
 
@@ -83,14 +84,29 @@ export async function generate(
               return;
             }
 
-            recentOutputHash.set(result.filename, currentHash);
-            const basedir = dirname(result.filename);
-            await lifecycleHooks(result.hooks).beforeOneFileWrite(result.filename);
-            await lifecycleHooks(config.hooks).beforeOneFileWrite(result.filename);
-            await mkdirp(basedir);
             const absolutePath = isAbsolute(result.filename)
               ? result.filename
               : join(input.cwd || process.cwd(), result.filename);
+
+            const basedir = dirname(absolutePath);
+            await mkdirp(basedir);
+
+            if (config.prettier) {
+              // the prettified content is NOT stored in recentOutputHash
+              // so a diff can be detected without prettification
+              content = await prettify(content, absolutePath);
+              // compare the prettified content with the previous hash
+              // to compare the content with an existing prettified file
+              if (hash(content) === previousHash) {
+                debugLog(`Skipping file (${result.filename}) writing due to indentical hash after prettier...`);
+                return;
+              }
+            }
+
+            recentOutputHash.set(result.filename, currentHash);
+            await lifecycleHooks(result.hooks).beforeOneFileWrite(result.filename);
+            await lifecycleHooks(config.hooks).beforeOneFileWrite(result.filename);
+            await mkdirp(basedir);
             await writeFile(absolutePath, result.content);
             await lifecycleHooks(result.hooks).afterOneFileWrite(result.filename);
             await lifecycleHooks(config.hooks).afterOneFileWrite(result.filename);
